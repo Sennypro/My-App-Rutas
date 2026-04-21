@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
   <link rel="stylesheet" href="./styles.css"/>
+  <link rel="manifest" href="manifest.json">
 </head>
 
 <body>
@@ -22,6 +23,11 @@
   <div class="map-overlay-top">
     <div class="nav-bar">
       <span class="nav-title">Ruta</span>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button type="button" class="secondary" id="btnAddClient">➕ Agregar cliente</button>
+        <button type="button" class="secondary" id="btnViewRoute">🗺️ Ver ruta</button>
+        <button type="button" class="secondary" id="btnSummary">📊 Resumen</button>
+      </div>
       <div class="nav-chips">
         <span class="chip muted" id="chipDist">—</span>
         <span class="chip muted" id="chipDur">—</span>
@@ -287,6 +293,8 @@
 </div>
 
 <script type="module" src="./js/app.js"></script>
+<script type="module" src="./js/map.js"></script>
+<script type="module" src="./js/clientes.js"></script>
 
 </body>
 </html>

@@ -12,6 +12,10 @@ const map = L.map('map', {
   zoomSnap: 0.5
 }).setView([6.2442, -75.5812], 13);
 
+// Exponer `map` para módulos externos
+window.map = null;
+setTimeout(() => { try{ window.map = map; }catch(_){ } }, 0);
+
 map.createPane('cartoBase');
 map.getPane('cartoBase').style.zIndex = 200;
 map.createPane('cartoLabels');
@@ -68,6 +72,10 @@ const MUNICIPIOS_ORIENTE = [
 let routeStops = [];
 let savedClients = [];
 
+// Funciones para acceso externo (otros módulos pueden usarlas)
+window.getSavedClients = () => savedClients;
+window.getRouteStops = () => routeStops;
+
 let wizMunicipio = '';
 let wizLugarText = '';
 let wizPreview = null;
@@ -118,6 +126,8 @@ function loadClients(){
     const raw = localStorage.getItem(LS_CLIENTS);
     const arr = raw ? JSON.parse(raw) : [];
     savedClients = Array.isArray(arr) ? arr.map(migrateClientRow).filter(Boolean) : [];
+    // Exponer referencia actualizada
+    window.savedClients = savedClients;
   }catch(_){
     savedClients = [];
   }
@@ -125,6 +135,9 @@ function loadClients(){
 
 function persistClients(){
   localStorage.setItem(LS_CLIENTS, JSON.stringify(savedClients));
+  try{ window.savedClients = savedClients; }catch(_){ }
+  try{ if (typeof window.renderClientMarkers === 'function') window.renderClientMarkers(); }catch(_){ }
+  try{ updateFinancialSummary(); }catch(_){ }
 }
 
 function renderClients(){
@@ -215,6 +228,7 @@ function addClientStopToRoute(c){
   });
   renderRouteStops();
   setStatus(`Se agregó a la ruta: ${label}`);
+  try{ if (typeof window.renderClientMarkers === 'function') window.renderClientMarkers(); }catch(_){ }
 }
 
 function renderRouteStops(){
@@ -1134,6 +1148,8 @@ function initCrmUi(){
     persistClients();
     renderClients();
     crmClearForm();
+    try{ if (typeof window.renderClientMarkers === 'function') window.renderClientMarkers(); }catch(_){ }
+    try{ updateFinancialSummary(); }catch(_){ }
     setStatus('Cliente guardado.');
   });
 }
@@ -1319,6 +1335,29 @@ async function optimizarYCrearRuta(){
   try{
     const useGps = document.getElementById('useGpsStart').checked;
     const stopsInput = getStopsForRouting();
+    // Filtrar clientes no disponibles: almuerzo o cerrados. Avisar al usuario.
+    const nowMin = minutesSinceMidnight(Date.now());
+    const filtered = [];
+    const skipped = [];
+    for (const st of stopsInput){
+      if (st.clientId){
+        const c = savedClients.find(x => x.id === st.clientId);
+        if (c){
+          const lunchS = parseHHMM(c.lunchStart || '99:99');
+          const lunchE = parseHHMM(c.lunchEnd || '99:99');
+          const open = parseHHMM(c.openTime || '00:00');
+          const close = parseHHMM(c.closeTime || '23:59');
+          if (nowMin >= lunchS && nowMin < lunchE){ skipped.push({st,c,reason:'almuerzo'}); continue; }
+          if (nowMin < open || nowMin > close){ skipped.push({st,c,reason:'cerrado'}); continue; }
+        }
+      }
+      filtered.push(st);
+    }
+    if (skipped.length){
+      for (const s of skipped){
+        setStatus(`Se omitió ${s.c?.name || s.st.label}: ${s.reason}`, true);
+      }
+    }
     if (useGps){
       if (stopsInput.length < 1) throw new Error('Agregá al menos una parada (o desactivá “Inicio en mi ubicación” y pon dos).');
       if (stopsInput.length > 11) throw new Error('Máximo 11 paradas con GPS como inicio.');
@@ -1348,8 +1387,24 @@ async function optimizarYCrearRuta(){
     }
 
     setStatus('Buscando direcciones…');
-    for (let i=0;i<stopsInput.length;i++){
-      const st = stopsInput[i];
+    // Ordenar por prioridad y distancia antes de geocodificar
+    let stopsToProcess = filtered.slice();
+    try{
+      const userLoc = userLocation || null;
+      if (typeof sortClientsForRouting === 'function'){
+        // si la parada referencia un cliente, reordenar según cliente
+        stopsToProcess.sort((a,b)=>{
+          const ca = a.clientId ? savedClients.find(x=>x.id===a.clientId) : null;
+          const cb = b.clientId ? savedClients.find(x=>x.id===b.clientId) : null;
+          if (ca && cb){
+            return sortClientsForRouting([ca,cb], userLoc).indexOf(ca) - sortClientsForRouting([ca,cb], userLoc).indexOf(cb);
+          }
+          return 0;
+        });
+      }
+    }catch(_){ }
+    for (let i=0;i<stopsToProcess.length;i++){
+      const st = stopsToProcess[i];
       setStatus(`Parada ${i+1}/${stopsInput.length}…\n${st.label}`);
       if(i>0 || geocoded.length>0) await new Promise(r => setTimeout(r, 350));
       if (Number.isFinite(st.lat) && Number.isFinite(st.lon)){
@@ -1363,6 +1418,8 @@ async function optimizarYCrearRuta(){
         geocoded.push(await geocodeNominatim(q));
       }
     }
+
+    if (!geocoded.length) throw new Error('No hay paradas disponibles para calcular la ruta.');
 
     document.getElementById('nStops').textContent = String(geocoded.length);
 
@@ -1638,6 +1695,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   initWizardUi();
   renderClients();
   renderRouteStops();
+  // toolbar buttons
+  document.getElementById('btnAddClient')?.addEventListener('click', () => { showView('clients'); document.getElementById('crmName')?.focus(); });
+  document.getElementById('btnViewRoute')?.addEventListener('click', () => { showView('main'); });
+  document.getElementById('btnSummary')?.addEventListener('click', () => { const el = document.getElementById('financialSummary'); if(el) el.scrollIntoView({behavior:'smooth'}); });
   document.getElementById('btnPlay').textContent = 'Navegar (GPS)';
   document.getElementById('btnPlayPeek').textContent = 'Navegar (GPS)';
   maybeVehicleNotification();
