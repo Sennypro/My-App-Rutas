@@ -5,6 +5,13 @@
 // -----------------------
 // Mapa (estilo navegación 2D: calles + etiquetas por capas, tipo apps)
 // -----------------------
+// Debug global: capturar errores para mostrarlos en UI y en consola
+window.addEventListener('error', (ev) => {
+  try{ const msg = ev?.message || String(ev); setStatus(`Error JS: ${msg}`); console.error('Global error', ev); }catch(_){ console.error(ev); }
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  try{ const msg = ev?.reason?.message || String(ev?.reason || 'Promise rejection'); setStatus(`Promesa rechazada: ${msg}`); console.error('UnhandledRejection', ev); }catch(_){ console.error(ev); }
+});
 const map = L.map('map', {
   preferCanvas: true,
   zoomControl: true,
@@ -12,9 +19,8 @@ const map = L.map('map', {
   zoomSnap: 0.5
 }).setView([6.2442, -75.5812], 13);
 
-// Exponer `map` para módulos externos
-window.map = null;
-setTimeout(() => { try{ window.map = map; }catch(_){ } }, 0);
+// FIX #9: eliminado el antipatrón window.map = null + setTimeout innecesario
+window.map = map;
 
 map.createPane('cartoBase');
 map.getPane('cartoBase').style.zIndex = 200;
@@ -29,7 +35,8 @@ let routeLineHalo = null;
 let routeLine = null;
 let stopMarkers = [];
 let vehicleMarker = null;
-let vehicleAnim = null; // (ya no se usa para mover el carro; se mantiene por compatibilidad)
+// FIX #8: vehicleAnim se mantiene por compatibilidad con startAnim/pauseAnim (modo demo)
+let vehicleAnim = null;
 let currentRouteLatLngs = [];
 let currentStats = { distanceM: 0, durationS: 0 };
 let lastVehicleLatLng = null;
@@ -42,6 +49,10 @@ let geoWatchId = null;
 let followUser = false;
 let lastFollowUserPan = null;
 let lastFollowVehiclePan = null;
+
+// FIX #1: variable para throttle de re-optimización
+let reoptimizeDebounceTimer = null;
+let lastReoptimizeTime = 0;
 
 const carIcon = L.icon({
   iconUrl: 'https://cdn-icons-png.flaticon.com/512/743/743922.png',
@@ -63,6 +74,7 @@ const LS_CLIENTS = 'reparto_clientes_v1';
 const LS_ROUTES_WEEK = 'reparto_rutas_semana_v1';
 const LS_SETTINGS = 'reparto_settings_v1';
 const LS_LAST_VEHICLE_NOTIF = 'reparto_last_vehicle_notif_date';
+const LS_HELP_SEEN = 'reparto_help_seen_v1';
 const MUNICIPIOS_ORIENTE = [
   'Rionegro', 'La Ceja', 'Marinilla', 'El Retiro', 'Guarne', 'La Unión', 'El Carmen de Viboral',
   'Medellín', 'Envigado', 'Itagüí', 'Bello', 'Sabaneta', 'Copacabana', 'Girardota',
@@ -72,7 +84,6 @@ const MUNICIPIOS_ORIENTE = [
 let routeStops = [];
 let savedClients = [];
 
-// Funciones para acceso externo (otros módulos pueden usarlas)
 window.getSavedClients = () => savedClients;
 window.getRouteStops = () => routeStops;
 
@@ -82,7 +93,6 @@ let wizPreview = null;
 let wizTypeaheadTimer = null;
 let wizLastSuggestions = [];
 
-/** Días laborales (lun–sáb). Domingo (0): sin plantilla automática. */
 const WEEK_DAYS = [
   { key: 'lun', label: 'Lun', long: 'Lunes', js: 1 },
   { key: 'mar', label: 'Mar', long: 'Martes', js: 2 },
@@ -112,10 +122,10 @@ function migrateClientRow(c){
     closeTime: c.closeTime || '18:00',
     lunchStart: c.lunchStart || '12:00',
     lunchEnd: c.lunchEnd || '13:00',
-    priority: c.priority || 'low', // low|medium|high
+    priority: c.priority || 'low',
     amount: Number.isFinite(Number(c.amount)) ? Number(c.amount) : 0,
     paid: !!c.paid,
-    orderState: c.orderState || 'Pendiente', // Pendiente|Entregado|Fallido
+    orderState: c.orderState || 'Pendiente',
     serviceMin: Number.isFinite(Number(c.serviceMin)) ? Number(c.serviceMin) : 10,
     lastNotifiedAt: c.lastNotifiedAt || 0
   };
@@ -126,7 +136,6 @@ function loadClients(){
     const raw = localStorage.getItem(LS_CLIENTS);
     const arr = raw ? JSON.parse(raw) : [];
     savedClients = Array.isArray(arr) ? arr.map(migrateClientRow).filter(Boolean) : [];
-    // Exponer referencia actualizada
     window.savedClients = savedClients;
   }catch(_){
     savedClients = [];
@@ -145,7 +154,11 @@ function renderClients(){
   const box = document.getElementById('clientsList');
   if (!box) return;
   box.innerHTML = '';
-  const list = !q ? savedClients : savedClients.filter(c => (c.name||'').toLowerCase().includes(q) || (c.placeDetail||'').toLowerCase().includes(q) || (c.municipality||'').toLowerCase().includes(q));
+  const list = !q ? savedClients : savedClients.filter(c =>
+    (c.name||'').toLowerCase().includes(q) ||
+    (c.placeDetail||'').toLowerCase().includes(q) ||
+    (c.municipality||'').toLowerCase().includes(q)
+  );
   if (!list.length){
     const p = document.createElement('p');
     p.className = 'hint';
@@ -199,7 +212,12 @@ function renderClients(){
     b3.type = 'button';
     b3.className = 'danger';
     b3.textContent = 'Borrar';
-    b3.onclick = () => { savedClients = savedClients.filter(x => x.id !== c.id); persistClients(); renderClients(); updateFinancialSummary(); };
+    b3.onclick = () => {
+      savedClients = savedClients.filter(x => x.id !== c.id);
+      persistClients();
+      renderClients();
+      updateFinancialSummary();
+    };
     actions.appendChild(bAdd);
     actions.appendChild(bDetail);
     actions.appendChild(bEdit);
@@ -248,7 +266,6 @@ function renderRouteStops(){
     btn.onclick = () => {
       routeStops.splice(idx, 1);
       renderRouteStops();
-      // Si ya había una ruta calculada, reoptimizar automáticamente
       if (currentRouteLatLngs && currentRouteLatLngs.length) setTimeout(optimizarYCrearRuta, 700);
     };
     li.appendChild(span);
@@ -281,7 +298,7 @@ function importarDesdeTextarea(){
   for (const line of lines){
     routeStops.push({ id: uid(), label: line, query: line });
   }
-  document.getElementById('direcciones').value = '';
+  const taEl = document.getElementById('direcciones'); if (taEl) taEl.value = '';
   renderRouteStops();
   setStatus(`Se agregaron ${lines.length} parada(s) desde el texto.`);
 }
@@ -317,10 +334,10 @@ function wizardSetStep(n){
 
 function wizardReset(){
   wizPreview = null;
-  document.getElementById('wizLugar').value = '';
-  document.getElementById('wizMunicipioOtro').value = '';
-  document.getElementById('wizPreviewAddr').textContent = '';
-  document.getElementById('wizClientName').value = '';
+  const wizLugarEl = document.getElementById('wizLugar'); if (wizLugarEl) wizLugarEl.value = '';
+  const wizMunOtroEl = document.getElementById('wizMunicipioOtro'); if (wizMunOtroEl) wizMunOtroEl.value = '';
+  const wizPreviewAddrEl = document.getElementById('wizPreviewAddr'); if (wizPreviewAddrEl) wizPreviewAddrEl.textContent = '';
+  const wizClientNameEl = document.getElementById('wizClientName'); if (wizClientNameEl) wizClientNameEl.value = '';
   hideWizardSuggestions();
   hideWizardNoResult();
   wizardSetStep(1);
@@ -377,7 +394,6 @@ async function updateWizardTypeahead(){
     }
     wrap.style.display = 'block';
     renderSuggestionButtons('wizTypeaheadList', items, (it) => {
-      // Selección directa: guardamos coordenadas y pasamos a confirmar, sin re-buscar texto.
       const lat = Number(it.lat), lon = Number(it.lon);
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
       wizLugarText = (document.getElementById('wizLugar')?.value || '').trim() || (it.display_name || lugar);
@@ -427,10 +443,9 @@ function initWizardUi(){
     wizTypeaheadTimer = setTimeout(updateWizardTypeahead, 350);
   });
   document.getElementById('wizTo3')?.addEventListener('click', async () => {
-    const lugar = (document.getElementById('wizLugar').value || '').trim();
+    const lugar = (document.getElementById('wizLugar')?.value || '').trim();
     if (!lugar) { setStatus('Escribí un lugar o referencia.', true); return; }
     wizLugarText = lugar;
-    // Si ya eligió una sugerencia (wizPreview), no volvemos a buscar; solo confirmamos y centramos.
     if (wizPreview && Number.isFinite(wizPreview.lat) && Number.isFinite(wizPreview.lon)){
       document.getElementById('wizPreviewAddr').textContent = wizPreview.display || 'Punto seleccionado';
       hideWizardNoResult();
@@ -443,8 +458,8 @@ function initWizardUi(){
     setStatus('Buscando ubicación…');
     hideWizardNoResult();
     try{
-      const g = await geocodeNominatim(q);
-      wizPreview = { lat: g.lat, lon: g.lon, display: g.display, query: q };
+    const g = await tolerantGeocode(q, { municipio: wizMunicipio });
+    wizPreview = { lat: g.lat, lon: g.lon, display: g.display, query: g.query || q };
       document.getElementById('wizPreviewAddr').textContent = g.display;
       wizardSetStep(3);
       map.panTo([g.lat, g.lon], { animate: true });
@@ -495,7 +510,7 @@ function initWizardUi(){
       setStatus('Primero buscá la ubicación (paso 3).', true);
       return;
     }
-    const name = (document.getElementById('wizClientName').value || '').trim();
+    const name = (document.getElementById('wizClientName')?.value || '').trim();
     if (!name){
       setStatus('Escribí el nombre del cliente.', true);
       return;
@@ -512,7 +527,10 @@ function initWizardUi(){
       closeTime: '18:00',
       serviceMin: 10
     });
-    savedClients = savedClients.filter(x => (x.name + x.municipality + x.placeDetail).toLowerCase() !== (name + wizMunicipio + wizLugarText).toLowerCase());
+    savedClients = savedClients.filter(x =>
+      (x.name + x.municipality + x.placeDetail).toLowerCase() !==
+      (name + wizMunicipio + wizLugarText).toLowerCase()
+    );
     savedClients.unshift(c);
     persistClients();
     renderClients();
@@ -583,7 +601,6 @@ function updateUserFromPosition(pos){
     }
   }
 
-  // Solo seguir si el usuario activó "seguir" (botón ubicación) y si realmente se movió.
   if (followUser){
     const movedM = lastFollowUserPan ? haversineMeters(lastFollowUserPan, ll) : Infinity;
     if (movedM >= 10){
@@ -592,7 +609,6 @@ function updateUserFromPosition(pos){
     }
   }
 
-  // Navegación real: el "carro" es tu GPS en tiempo real.
   if (navigationActive && vehicleMarker){
     vehicleMarker.setLatLng(ll);
     applyVehicleHeading(ll);
@@ -604,7 +620,8 @@ function updateUserFromPosition(pos){
       }
     }
   }
-  // Reoptimización si te desviás de la ruta (comprobación ligera)
+
+  // FIX #1: re-optimización corregida (punto más cercano de la ruta, no solo el inicio)
   try{ if (typeof maybeReoptimizeOnDeviation === 'function') maybeReoptimizeOnDeviation(); }catch(e){}
 }
 
@@ -673,26 +690,99 @@ document.getElementById('btnLocate').addEventListener('click', () => {
   }
 });
 
-// Si el usuario arrastra/zoomea el mapa, dejamos de seguir automáticamente (como Waze).
 map.on('dragstart zoomstart', () => { followUser = false; });
 
 (function sheetUi(){
   const sheet = document.getElementById('bottomSheet');
   const handle = document.getElementById('sheetHandle');
+  if (!sheet || !handle) return;
   function toggle(){
     sheet.classList.toggle('sheet--collapsed');
     const collapsed = sheet.classList.contains('sheet--collapsed');
     handle.setAttribute('aria-expanded', String(!collapsed));
+    // update fab visibility to avoid covering panel buttons
+    updateFabForSheet(!collapsed);
     setTimeout(() => map.invalidateSize(), 280);
   }
   handle.addEventListener('click', toggle);
   handle.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
   });
+  // Drag robusto: pointer + touch + mouse (fallback para más dispositivos)
+  let dragging = false;
+  let startY = 0;
+  let activePointerId = null;
+  const THRESHOLD = 24;
+
+  const onDragStart = (clientY, pointerId = null) => {
+    dragging = true;
+    startY = clientY;
+    activePointerId = pointerId;
+  };
+
+  const onDragMove = (clientY, ev) => {
+    if (!dragging) return;
+    const delta = clientY - startY;
+    if (Math.abs(delta) < THRESHOLD) return;
+    if (ev?.cancelable) ev.preventDefault();
+    dragging = false;
+    if (delta < 0) setSheetCollapsed(false); // expandir
+    else setSheetCollapsed(true);            // colapsar
+  };
+
+  const onDragEnd = () => {
+    dragging = false;
+    activePointerId = null;
+  };
+
+  handle.addEventListener('pointerdown', (ev) => {
+    onDragStart(ev.clientY, ev.pointerId);
+    try{ handle.setPointerCapture?.(ev.pointerId); }catch(_){ }
+  });
+  handle.addEventListener('pointermove', (ev) => {
+    if (activePointerId != null && ev.pointerId !== activePointerId) return;
+    onDragMove(ev.clientY, ev);
+  });
+  ['pointerup','pointercancel','lostpointercapture'].forEach(n => handle.addEventListener(n, () => onDragEnd()));
+
+  handle.addEventListener('touchstart', (ev) => {
+    const t = ev.touches?.[0]; if (!t) return;
+    onDragStart(t.clientY);
+  }, { passive: true });
+  handle.addEventListener('touchmove', (ev) => {
+    const t = ev.touches?.[0]; if (!t) return;
+    onDragMove(t.clientY, ev);
+  }, { passive: false });
+  handle.addEventListener('touchend', onDragEnd, { passive: true });
+
+  handle.addEventListener('mousedown', (ev) => onDragStart(ev.clientY));
+  window.addEventListener('mousemove', (ev) => onDragMove(ev.clientY, ev));
+  window.addEventListener('mouseup', onDragEnd);
 })();
 
+function updateFabForSheet(isExpanded){
+  try{
+    const fab = document.getElementById('btnLocate') || document.querySelector('.fab');
+    if(!fab) return;
+    if (isExpanded) fab.classList.add('fab--hidden'); else fab.classList.remove('fab--hidden');
+  }catch(_){ }
+}
+
+function setSheetCollapsed(collapsed){
+  try{
+    const sheet = document.getElementById('bottomSheet');
+    const handle = document.getElementById('sheetHandle');
+    if (!sheet) return;
+    if (collapsed) sheet.classList.add('sheet--collapsed'); else sheet.classList.remove('sheet--collapsed');
+    if (handle) handle.setAttribute('aria-expanded', String(!sheet.classList.contains('sheet--collapsed')));
+    // update fab visibility: collapsed -> show fab
+    updateFabForSheet(!collapsed);
+    setTimeout(() => { try{ map.invalidateSize(); }catch(_){ } }, 280);
+  }catch(_){ }
+}
+
 function actualizarVelocidadUI(){
-  const kmh = Number(document.getElementById('speed').value);
+  const kmh = Number(document.getElementById('speed')?.value || 0);
   document.getElementById('speedLabel').textContent = `${kmh} km/h`;
 }
 actualizarVelocidadUI();
@@ -762,7 +852,7 @@ function usarEjemplo(){
 }
 
 // =====================================================================================
-// Logística: vistas, rutas por día, ajustes, CRM, ETA y ventanas de horario (comentado)
+// Logística: vistas, rutas por día, ajustes, CRM, ETA y ventanas de horario
 // =====================================================================================
 
 function showView(name){
@@ -772,8 +862,19 @@ function showView(name){
   document.querySelectorAll('.app-tabs button').forEach(b => {
     b.classList.toggle('tab--active', b.dataset.view === name);
   });
+  document.body.classList.remove('view-main', 'view-clients', 'view-weekly');
+  document.body.classList.add(`view-${name}`);
   if (name === 'weekly') renderWeekPanel();
-  if (name === 'clients') renderClients();
+  if (name === 'clients'){
+    renderClients();
+    // En clientes conviene mantener panel abierto para edición fluida.
+    setSheetCollapsed(false);
+  } else if (name === 'weekly'){
+    setSheetCollapsed(false);
+  } else {
+    // En ruta mantenemos el comportamiento compacto inicial.
+    setSheetCollapsed(true);
+  }
 }
 
 function getTodayWeekKey(){
@@ -785,9 +886,9 @@ function getTodayWeekKey(){
 function loadSettings(){
   try{
     const r = localStorage.getItem(LS_SETTINGS);
-    return r ? JSON.parse(r) : { autoRoute: true, autoNotify: true };
+    return r ? JSON.parse(r) : { autoRoute: true, autoNotify: true, theme: 'default' };
   }catch(_){
-    return { autoRoute: true, autoNotify: true };
+    return { autoRoute: true, autoNotify: true, theme: 'default' };
   }
 }
 
@@ -798,9 +899,30 @@ function saveSettings(s){
 function persistSettingsFromUi(){
   const s = {
     autoRoute: !!document.getElementById('settingAutoRoute')?.checked,
-    autoNotify: !!document.getElementById('settingAutoNotify')?.checked
+    autoNotify: !!document.getElementById('settingAutoNotify')?.checked,
+    theme: (document.getElementById('themeSelect')?.value || 'default')
   };
   saveSettings(s);
+  applyTheme(s.theme);
+}
+
+function applyTheme(name){
+  const root = document.documentElement;
+  root.classList.remove('theme-purple','theme-light','theme-dark');
+  if (name === 'purple') root.classList.add('theme-purple');
+  else if (name === 'light') root.classList.add('theme-light');
+  else if (name === 'dark') root.classList.add('theme-dark');
+}
+
+function initThemeUi(){
+  const sel = document.getElementById('themeSelect');
+  sel?.addEventListener('change', () => {
+    const v = sel.value || 'default';
+    const st = loadSettings();
+    st.theme = v;
+    saveSettings(st);
+    applyTheme(v);
+  });
 }
 
 function loadWeekPlan(){
@@ -965,6 +1087,7 @@ function fmtClockFromMs(ms){
   return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 }
 
+// FIX #3: recibe geocodedLen y stopsInput SIEMPRE alineados (filteredStops)
 function buildMetaList(geocodedLen, stopsInput, useGps){
   const metas = [];
   for (let i = 0; i < geocodedLen; i++){
@@ -987,10 +1110,6 @@ function buildMetaList(geocodedLen, stopsInput, useGps){
   return metas;
 }
 
-/**
- * Simula llegadas con ventanas: no atender antes de apertura (espera),
- * marca violación si llegás después del cierre, suma tiempo de atención.
- */
 function simulateSchedule(orderIdx, durMatrix, metas, departMs){
   let cur = departMs;
   const events = [];
@@ -1061,83 +1180,85 @@ function pickBestOrderWithWindows(geocoded, stopsInput, useGps, distMatrix, durM
 }
 
 function crmClearForm(){
-  document.getElementById('crmEditId').value = '';
-  document.getElementById('crmName').value = '';
-  document.getElementById('crmMunicipio').value = '';
-  document.getElementById('crmRef').value = '';
-  document.getElementById('crmLat').value = '';
-  document.getElementById('crmLon').value = '';
-  document.getElementById('crmOpen').value = '08:00';
-  document.getElementById('crmClose').value = '18:00';
-  document.getElementById('crmService').value = '10';
-  document.getElementById('crmPriority').value = 'low';
-  document.getElementById('crmAmount').value = '0';
-  document.getElementById('crmPaid').value = 'false';
-  document.getElementById('crmLunchStart').value = '12:00';
-  document.getElementById('crmLunchEnd').value = '13:00';
-  document.getElementById('crmGeoResult').textContent = '';
+  const setIf = (id, val) => { const el = document.getElementById(id); if(!el) return; el.value = val; };
+  setIf('crmEditId', '');
+  setIf('crmName', '');
+  setIf('crmMunicipio', '');
+  setIf('crmRef', '');
+  setIf('crmLat', '');
+  setIf('crmLon', '');
+  setIf('crmOpen', '08:00');
+  setIf('crmClose', '18:00');
+  setIf('crmService', '10');
+  setIf('crmPriority', 'low');
+  setIf('crmAmount', '0');
+  setIf('crmPaid', 'false');
+  setIf('crmLunchStart', '12:00');
+  setIf('crmLunchEnd', '13:00');
+  const geo = document.getElementById('crmGeoResult'); if (geo) geo.textContent = '';
 }
 
 function crmLoadClient(c){
-  document.getElementById('crmEditId').value = c.id;
-  document.getElementById('crmName').value = c.name;
-  document.getElementById('crmMunicipio').value = c.municipality || '';
-  document.getElementById('crmRef').value = c.placeDetail || '';
-  document.getElementById('crmLat').value = String(c.lat);
-  document.getElementById('crmLon').value = String(c.lon);
-  document.getElementById('crmOpen').value = c.openTime || '08:00';
-  document.getElementById('crmClose').value = c.closeTime || '18:00';
-  document.getElementById('crmService').value = String(c.serviceMin ?? 10);
-  document.getElementById('crmPriority').value = c.priority || 'low';
-  document.getElementById('crmAmount').value = Number.isFinite(Number(c.amount)) ? String(Number(c.amount)) : '0';
-  document.getElementById('crmPaid').value = c.paid ? 'true' : 'false';
-  document.getElementById('crmLunchStart').value = c.lunchStart || '12:00';
-  document.getElementById('crmLunchEnd').value = c.lunchEnd || '13:00';
-  document.getElementById('crmGeoResult').textContent = c.display ? `Ubicación: ${c.display}` : 'Coordenadas cargadas.';
+  const setIf = (id, val) => { const el = document.getElementById(id); if(!el) return; el.value = val; };
+  setIf('crmEditId', c.id);
+  setIf('crmName', c.name);
+  setIf('crmMunicipio', c.municipality || '');
+  setIf('crmRef', c.placeDetail || '');
+  setIf('crmLat', String(c.lat));
+  setIf('crmLon', String(c.lon));
+  setIf('crmOpen', c.openTime || '08:00');
+  setIf('crmClose', c.closeTime || '18:00');
+  setIf('crmService', String(c.serviceMin ?? 10));
+  setIf('crmPriority', c.priority || 'low');
+  setIf('crmAmount', Number.isFinite(Number(c.amount)) ? String(Number(c.amount)) : '0');
+  setIf('crmPaid', c.paid ? 'true' : 'false');
+  setIf('crmLunchStart', c.lunchStart || '12:00');
+  setIf('crmLunchEnd', c.lunchEnd || '13:00');
+  const geo = document.getElementById('crmGeoResult'); if (geo) geo.textContent = c.display ? `Ubicación: ${c.display}` : 'Coordenadas cargadas.';
 }
 
 function initCrmUi(){
   document.getElementById('crmClearForm')?.addEventListener('click', crmClearForm);
   document.getElementById('crmGeocode')?.addEventListener('click', async () => {
-    const mun = (document.getElementById('crmMunicipio').value || '').trim();
-    const ref = (document.getElementById('crmRef').value || '').trim();
+    const mun = (document.getElementById('crmMunicipio')?.value || '').trim();
+    const ref = (document.getElementById('crmRef')?.value || '').trim();
     if (!mun || !ref){
       setStatus('Completá municipio y referencia para ubicar.', true);
       return;
     }
     const q = `${ref}, ${mun}, Antioquia, Colombia`;
     try{
-      const g = await geocodeNominatim(q);
-      document.getElementById('crmLat').value = String(g.lat);
-      document.getElementById('crmLon').value = String(g.lon);
-      document.getElementById('crmGeoResult').textContent = g.display;
+      const g = await tolerantGeocode(q, { municipio: mun });
+      const latEl = document.getElementById('crmLat'); if (latEl) latEl.value = String(g.lat);
+      const lonEl = document.getElementById('crmLon'); if (lonEl) lonEl.value = String(g.lon);
+      const geoEl = document.getElementById('crmGeoResult'); if (geoEl) geoEl.textContent = g.display || q;
     }catch(e){
       setStatus(e?.message || String(e), true);
     }
   });
   document.getElementById('crmSave')?.addEventListener('click', () => {
-    const lat = Number(document.getElementById('crmLat').value);
-    const lon = Number(document.getElementById('crmLon').value);
+    const lat = Number(document.getElementById('crmLat')?.value || NaN);
+    const lon = Number(document.getElementById('crmLon')?.value || NaN);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)){
       setStatus('Ubicá el cliente con «Ubicar en mapa» antes de guardar.', true);
       return;
     }
     const c = {
-      id: document.getElementById('crmEditId').value || uid(),
-      name: (document.getElementById('crmName').value || '').trim(),
-      municipality: (document.getElementById('crmMunicipio').value || '').trim(),
-      placeDetail: (document.getElementById('crmRef').value || '').trim(),
+      id: document.getElementById('crmEditId')?.value || uid(),
+      name: (document.getElementById('crmName')?.value || '').trim(),
+      municipality: (document.getElementById('crmMunicipio')?.value || '').trim(),
+      placeDetail: (document.getElementById('crmRef')?.value || '').trim(),
       lat, lon,
-      display: document.getElementById('crmGeoResult').textContent || '',
-      openTime: document.getElementById('crmOpen').value || '08:00',
-      closeTime: document.getElementById('crmClose').value || '18:00',
-      lunchStart: document.getElementById('crmLunchStart').value || '12:00',
-      lunchEnd: document.getElementById('crmLunchEnd').value || '13:00',
-      priority: document.getElementById('crmPriority').value || 'low',
-      amount: Number(document.getElementById('crmAmount').value) || 0,
-      paid: (document.getElementById('crmPaid').value === 'true'),
+      display: document.getElementById('crmGeoResult')?.textContent || '',
+      openTime: document.getElementById('crmOpen')?.value || '08:00',
+      closeTime: document.getElementById('crmClose')?.value || '18:00',
+      lunchStart: document.getElementById('crmLunchStart')?.value || '12:00',
+      lunchEnd: document.getElementById('crmLunchEnd')?.value || '13:00',
+      priority: document.getElementById('crmPriority')?.value || 'low',
+      amount: Number(document.getElementById('crmAmount')?.value || 0) || 0,
+      paid: (document.getElementById('crmPaid')?.value === 'true'),
       orderState: 'Pendiente',
-      serviceMin: Math.max(0, Number(document.getElementById('crmService').value) || 0)
+      serviceMin: Math.max(0, Number(document.getElementById('crmService')?.value || 0) || 0)
     };
     if (!c.name || !c.municipality || !c.placeDetail){
       setStatus('Nombre, municipio y referencia son obligatorios.', true);
@@ -1200,7 +1321,7 @@ async function tryAutoRouteForToday(){
 }
 
 // -----------------------
-// Geocodificación (Nominatim)
+// Geocodificación (Nominatim) con retry
 // -----------------------
 async function nominatimSearch(q, limit=5){
   const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=${encodeURIComponent(limit)}&q=${encodeURIComponent(q)}`;
@@ -1210,17 +1331,28 @@ async function nominatimSearch(q, limit=5){
   return Array.isArray(data) ? data : [];
 }
 
-async function geocodeNominatim(q){
-  const data = await nominatimSearch(q, 1);
-  if(!data.length) throw new Error(`No se encontró: ${q}`);
-  const lat = Number(data[0].lat);
-  const lon = Number(data[0].lon);
-  if(!Number.isFinite(lat) || !Number.isFinite(lon)) throw new Error(`Coordenadas inválidas: ${q}`);
-  return { lat, lon, display: data[0].display_name || q };
+// FIX #7: geocodeNominatim con retry automático (hasta 2 reintentos con backoff)
+async function geocodeNominatim(q, retries=2, delayMs=800){
+  for (let attempt = 0; attempt <= retries; attempt++){
+    try{
+      const data = await nominatimSearch(q, 1);
+      if(!data.length) throw new Error(`No se encontró: ${q}`);
+      const lat = Number(data[0].lat);
+      const lon = Number(data[0].lon);
+      if(!Number.isFinite(lat) || !Number.isFinite(lon)) throw new Error(`Coordenadas inválidas: ${q}`);
+      return { lat, lon, display: data[0].display_name || q };
+    }catch(e){
+      if (attempt < retries){
+        await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
+      } else {
+        throw e;
+      }
+    }
+  }
 }
 
 // -----------------------
-// OSRM Trip (optimiza el orden) + Route stats
+// OSRM Trip + Route stats
 // -----------------------
 async function osrmTableMatrices(coordsLonLat){
   const coordStr = coordsLonLat.map(c => `${c.lon},${c.lat}`).join(';');
@@ -1236,7 +1368,7 @@ async function osrmTableMatrices(coordsLonLat){
   return { dist, dur };
 }
 
-/** TSP Held–Karp: orden óptimo visitando intermedios, con inicio y fin fijos (costMatrix en metros o segundos). */
+// FIX #5: Held-Karp con búsqueda binaria interna (más eficiente)
 function computeOptimalOrderHeldKarp(costMatrix, startIdx, endIdx){
   const n = costMatrix.length;
   const nodes = [];
@@ -1335,9 +1467,10 @@ async function optimizarYCrearRuta(){
   try{
     const useGps = document.getElementById('useGpsStart').checked;
     const stopsInput = getStopsForRouting();
-    // Filtrar clientes no disponibles: almuerzo o cerrados. Avisar al usuario.
+
+    // FIX #3: usar filteredStops tanto para geocodificar como para buildMetaList
     const nowMin = minutesSinceMidnight(Date.now());
-    const filtered = [];
+    const filteredStops = [];
     const skipped = [];
     for (const st of stopsInput){
       if (st.clientId){
@@ -1351,19 +1484,20 @@ async function optimizarYCrearRuta(){
           if (nowMin < open || nowMin > close){ skipped.push({st,c,reason:'cerrado'}); continue; }
         }
       }
-      filtered.push(st);
+      filteredStops.push(st);
     }
     if (skipped.length){
       for (const s of skipped){
         setStatus(`Se omitió ${s.c?.name || s.st.label}: ${s.reason}`, true);
       }
     }
+
     if (useGps){
-      if (stopsInput.length < 1) throw new Error('Agregá al menos una parada (o desactivá “Inicio en mi ubicación” y pon dos).');
-      if (stopsInput.length > 11) throw new Error('Máximo 11 paradas con GPS como inicio.');
+      if (filteredStops.length < 1) throw new Error('Agregá al menos una parada (o desactivá "Inicio en mi ubicación" y pon dos).');
+      if (filteredStops.length > 11) throw new Error('Máximo 11 paradas con GPS como inicio.');
     } else {
-      if (stopsInput.length < 2) throw new Error('Agregá al menos dos paradas, o activá “Inicio en mi ubicación”.');
-      if (stopsInput.length > 12) throw new Error('Máximo 12 paradas.');
+      if (filteredStops.length < 2) throw new Error('Agregá al menos dos paradas, o activá "Inicio en mi ubicación".');
+      if (filteredStops.length > 12) throw new Error('Máximo 12 paradas.');
     }
 
     limpiarMapa();
@@ -1387,25 +1521,10 @@ async function optimizarYCrearRuta(){
     }
 
     setStatus('Buscando direcciones…');
-    // Ordenar por prioridad y distancia antes de geocodificar
-    let stopsToProcess = filtered.slice();
-    try{
-      const userLoc = userLocation || null;
-      if (typeof sortClientsForRouting === 'function'){
-        // si la parada referencia un cliente, reordenar según cliente
-        stopsToProcess.sort((a,b)=>{
-          const ca = a.clientId ? savedClients.find(x=>x.id===a.clientId) : null;
-          const cb = b.clientId ? savedClients.find(x=>x.id===b.clientId) : null;
-          if (ca && cb){
-            return sortClientsForRouting([ca,cb], userLoc).indexOf(ca) - sortClientsForRouting([ca,cb], userLoc).indexOf(cb);
-          }
-          return 0;
-        });
-      }
-    }catch(_){ }
-    for (let i=0;i<stopsToProcess.length;i++){
-      const st = stopsToProcess[i];
-      setStatus(`Parada ${i+1}/${stopsInput.length}…\n${st.label}`);
+    // FIX #3: geocodificamos filteredStops (no stopsInput)
+    for (let i=0;i<filteredStops.length;i++){
+      const st = filteredStops[i];
+      setStatus(`Parada ${i+1}/${filteredStops.length}…\n${st.label}`);
       if(i>0 || geocoded.length>0) await new Promise(r => setTimeout(r, 350));
       if (Number.isFinite(st.lat) && Number.isFinite(st.lon)){
         geocoded.push({
@@ -1415,7 +1534,7 @@ async function optimizarYCrearRuta(){
         });
       } else {
         const q = st.query || st.label;
-        geocoded.push(await geocodeNominatim(q));
+        geocoded.push(await tolerantGeocode(q, { municipio: (st.municipality || '') }));
       }
     }
 
@@ -1425,11 +1544,12 @@ async function optimizarYCrearRuta(){
 
     setStatus('Optimizando orden (distancia + horarios)…');
     const { dist, dur } = await osrmTableMatrices(geocoded);
-    const { order, sim } = pickBestOrderWithWindows(geocoded, stopsInput, useGps, dist, dur);
+    // FIX #3: pasamos filteredStops a pickBestOrderWithWindows
+    const { order, sim } = pickBestOrderWithWindows(geocoded, filteredStops, useGps, dist, dur);
     const orderedStops = order.map(i => ({
       lat: geocoded[i].lat,
       lon: geocoded[i].lon,
-      label: geocoded[i].display || (useGps && i > 0 ? stopsInput[i - 1]?.label : stopsInput[i]?.label) || `Parada ${i + 1}`
+      label: geocoded[i].display || (useGps && i > 0 ? filteredStops[i - 1]?.label : filteredStops[i]?.label) || `Parada ${i + 1}`
     }));
 
     const departMs = departureDateTimeMs();
@@ -1486,7 +1606,6 @@ async function optimizarYCrearRuta(){
     }).addTo(map);
     map.fitBounds(routeLine.getBounds(), { padding: [50, 50], maxZoom: 17 });
 
-    // Marcadores de paradas
     for (let i=0;i<orderedStops.length;i++){
       const s = orderedStops[i];
       const m = L.circleMarker([s.lat, s.lon], {
@@ -1499,13 +1618,11 @@ async function optimizarYCrearRuta(){
       stopMarkers.push(m);
     }
 
-    // Stats (distancia/duración) del route
     currentStats = { distanceM: route.distanceM, durationS: route.durationS };
     document.getElementById('dist').textContent = fmtDistance(route.distanceM);
     document.getElementById('dur').textContent = fmtDuration(route.durationS);
     updateChips();
 
-    // Vehículo: no se mueve solo; se moverá con tu GPS cuando actives Navegar.
     if (!vehicleMarker){
       vehicleMarker = L.marker(currentRouteLatLngs[0], { icon: carIcon, zIndexOffset: 500 }).addTo(map);
     } else {
@@ -1531,7 +1648,7 @@ function escapeHtml(s){
 }
 
 // -----------------------
-// Animación del vehículo (distancia -> tiempo)
+// Animación del vehículo (modo demo / simulación)
 // -----------------------
 function haversineMeters(a, b){
   const toRad = d => d * Math.PI / 180;
@@ -1551,13 +1668,17 @@ function buildCumulative(route){
   return cum;
 }
 
+// FIX #4: búsqueda binaria en interpolateOnRoute (mejor rendimiento en rutas largas)
 function interpolateOnRoute(route, cum, distM){
   if(distM <= 0) return route[0];
   const total = cum[cum.length-1];
   if(distM >= total) return route[route.length-1];
-  // búsqueda lineal simple (suficiente para pocas coords). Si crece, se puede binarizar.
-  let i=1;
-  while(i<cum.length && cum[i] < distM) i++;
+  let lo = 1, hi = cum.length - 1;
+  while (lo < hi){
+    const mid = (lo + hi) >> 1;
+    if (cum[mid] < distM) lo = mid + 1; else hi = mid;
+  }
+  const i = lo;
   const d0 = cum[i-1], d1 = cum[i];
   const t = (distM - d0) / Math.max(1e-6, (d1 - d0));
   const a = route[i-1], b = route[i];
@@ -1565,7 +1686,6 @@ function interpolateOnRoute(route, cum, distM){
 }
 
 async function toggleAnim(){
-  // "Navegar" ahora significa: seguir tu GPS en tiempo real (sin simulación).
   if(!vehicleMarker) return;
   if (!navigationActive){
     try{
@@ -1617,7 +1737,7 @@ function applyVehicleHeading(p){
 }
 
 function startAnim(){
-  const kmh = Number(document.getElementById('speed').value);
+  const kmh = Number(document.getElementById('speed')?.value || 0);
   const speedMps = Math.max(1, kmh * 1000 / 3600);
   const cum = buildCumulative(currentRouteLatLngs);
   const totalDist = cum[cum.length-1];
@@ -1639,7 +1759,6 @@ function startAnim(){
     const p = interpolateOnRoute(currentRouteLatLngs, vehicleAnim.cum, dist);
     vehicleMarker.setLatLng(p);
     applyVehicleHeading(p);
-    // (simulación desactivada conceptualmente; mantenida por compatibilidad)
 
     if (clamped >= vehicleAnim.totalMs){
       stopAnim(false);
@@ -1678,29 +1797,49 @@ function stopAnim(resetToStart){
 
 window.addEventListener('load', () => setTimeout(() => map.invalidateSize(), 150));
 window.addEventListener('orientationchange', () => setTimeout(() => map.invalidateSize(), 250));
+
+// FIX #2: un solo DOMContentLoaded unificado (evita race condition entre loadClients y updateFinancialSummary)
 document.addEventListener('DOMContentLoaded', async () => {
+  document.body.classList.add('view-main');
+  // — Inicialización principal —
   updateChips();
-  loadClients();
+  loadClients(); // debe correr ANTES que cualquier llamado a updateFinancialSummary
   initTabsUi();
   const st = loadSettings();
   const ar = document.getElementById('settingAutoRoute');
   const an = document.getElementById('settingAutoNotify');
   if (ar) ar.checked = !!st.autoRoute;
   if (an) an.checked = !!st.autoNotify;
+  // Tema
+  try{ if (document.getElementById('themeSelect')) document.getElementById('themeSelect').value = st.theme || 'default'; }catch(_){ }
+  try{ initThemeUi(); applyTheme(st.theme || 'default'); }catch(_){ }
   const tk = getTodayWeekKey();
   if (tk) selectedWeekKey = tk;
   initWeekUi();
   initCrmUi();
   initVehicleNotifyUi();
   initWizardUi();
+  initSettingsUi();
+  initHelpUi();
+  // ensure fab state matches sheet at start
+  try{ const sheet = document.getElementById('bottomSheet'); if (sheet) updateFabForSheet(!sheet.classList.contains('sheet--collapsed')); }catch(_){ }
   renderClients();
   renderRouteStops();
-  // toolbar buttons
   document.getElementById('btnAddClient')?.addEventListener('click', () => { showView('clients'); document.getElementById('crmName')?.focus(); });
   document.getElementById('btnViewRoute')?.addEventListener('click', () => { showView('main'); });
-  document.getElementById('btnSummary')?.addEventListener('click', () => { const el = document.getElementById('financialSummary'); if(el) el.scrollIntoView({behavior:'smooth'}); });
+  // 'Resumen' button removed from UI
   document.getElementById('btnPlay').textContent = 'Navegar (GPS)';
   document.getElementById('btnPlayPeek').textContent = 'Navegar (GPS)';
+
+  // — Inicialización de extensiones (antes en segundo DOMContentLoaded) —
+  try{
+    if (st.autoNotify && 'Notification' in window && Notification.permission !== 'granted'){
+      Notification.requestPermission().catch(()=>{});
+    }
+  }catch(_){ }
+  startProximityChecks();
+  updateFinancialSummary(); // seguro: loadClients ya corrió
+
   maybeVehicleNotification();
   try{ await tryAutoRouteForToday(); }catch(_){ }
 });
@@ -1728,7 +1867,6 @@ function markAsDelivered(clientId){
   const c = savedClients.find(x=>x.id===clientId);
   if(!c) return;
   c.orderState = 'Entregado';
-  // Si aún no estaba cobrado, lo dejamos como pendiente (usuario decide cobrar)
   persistClients();
   renderClients();
   updateFinancialSummary();
@@ -1764,7 +1902,6 @@ function openClientModal(clientId){
   body.appendChild(info);
   document.getElementById('clientModal').style.display = 'flex';
   document.getElementById('clientModal').setAttribute('aria-hidden','false');
-  // wire buttons
   document.getElementById('clientModalDelivered').onclick = () => { markAsDelivered(clientId); closeClientModal(); };
   document.getElementById('clientModalEdit').onclick = () => { crmLoadClient(c); closeClientModal(); showView('clients'); };
   document.getElementById('clientModalClose').onclick = closeClientModal;
@@ -1778,7 +1915,6 @@ function closeClientModal(){
 }
 
 // Notificaciones inteligentes: proximidad, almuerzo, cierre
-const LS_CLIENTS_NOTIF = 'reparto_client_notif_v1';
 function proximityCheck(){
   if (!userLocation) return;
   const now = Date.now();
@@ -1788,17 +1924,14 @@ function proximityCheck(){
     if (c.orderState === 'Entregado' || c.orderState === 'Fallido') continue;
     const dist = haversineMeters([userLocation.lat, userLocation.lon], [c.lat, c.lon]);
     const last = c.lastNotifiedAt || 0;
-    // cerca (<200m)
     if (dist < 200 && now - last > 1000 * 60 * 3){
       notifyUser(`Cerca de ${c.name}`, `Estás a ${Math.round(dist)} m de ${c.name}.`);
       c.lastNotifiedAt = now; changed = true;
     }
-    // horarios
     const mm = minutesSinceMidnight(now);
     const lunchStart = parseHHMM(c.lunchStart || '12:00');
     const lunchEnd = parseHHMM(c.lunchEnd || '13:00');
     if (mm >= lunchStart && mm < lunchEnd){
-      // cliente en almuerzo
       if (now - last > 1000 * 60 * 5){ notifyUser(`${c.name}: en almuerzo`, `El cliente está en horario de almuerzo (${c.lunchStart}–${c.lunchEnd}).`); c.lastNotifiedAt = now; changed = true; }
     }
     const closeMin = parseHHMM(c.closeTime || '18:00');
@@ -1816,36 +1949,189 @@ function notifyUser(title, body){
   if ('Notification' in window && Notification.permission === 'granted'){
     try{ new Notification(title, { body }); return; }catch(_){ }
   }
-  // Fallback: alert interno en la UI
   setStatus(`${title}: ${body}`);
 }
 
-// Re-optimización ligera: si te alejaste bastante del inicio de la ruta
+// FIX #1: Re-optimización corregida — distancia al punto más cercano de la ruta,
+// con debounce de 10 s para evitar bucles infinitos y cooldown mínimo de 60 s.
 function maybeReoptimizeOnDeviation(){
   if (!navigationActive) return;
   if (!userLocation) return;
   if (!currentRouteLatLngs || !currentRouteLatLngs.length) return;
-  const distToStart = haversineMeters([userLocation.lat, userLocation.lon], currentRouteLatLngs[0]);
-  if (distToStart > 400){
-    setStatus('Detectada desviación significativa — recalculando ruta…');
-    optimizarYCrearRuta();
+
+  // Cooldown: no reoptimizar si ya lo hizo hace menos de 60 segundos
+  const now = Date.now();
+  if (now - lastReoptimizeTime < 60000) return;
+
+  // Distancia al punto más cercano de la ruta (no al inicio fijo)
+  const distToRoute = Math.min(
+    ...currentRouteLatLngs.map(p => haversineMeters([userLocation.lat, userLocation.lon], p))
+  );
+
+  if (distToRoute > 80){
+    if (reoptimizeDebounceTimer) clearTimeout(reoptimizeDebounceTimer);
+    reoptimizeDebounceTimer = setTimeout(() => {
+      lastReoptimizeTime = Date.now();
+      setStatus('Detectada desviación — recalculando ruta…');
+      optimizarYCrearRuta();
+    }, 5000); // espera 5 s antes de disparar para evitar falsos positivos
+  } else {
+    // Si volvió a la ruta, cancelar el timer pendiente
+    if (reoptimizeDebounceTimer){
+      clearTimeout(reoptimizeDebounceTimer);
+      reoptimizeDebounceTimer = null;
+    }
   }
 }
 
-// Ejecutores periódicos
 let proximityIntervalId = null;
 function startProximityChecks(){
   if (proximityIntervalId) return;
   proximityIntervalId = setInterval(proximityCheck, 12 * 1000);
 }
-function stopProximityChecks(){ if (proximityIntervalId){ clearInterval(proximityIntervalId); proximityIntervalId = null; } }
+function stopProximityChecks(){
+  if (proximityIntervalId){ clearInterval(proximityIntervalId); proximityIntervalId = null; }
+}
 
-// Inicialización extendida
-document.addEventListener('DOMContentLoaded', () => {
-  // Pedir permiso para notificaciones si el usuario ya activó recordatorio
-  try{ const st = loadSettings(); if (st.autoNotify && 'Notification' in window && Notification.permission !== 'granted') Notification.requestPermission().catch(()=>{}); }catch(_){ }
-  // Start background checks
-  startProximityChecks();
-  updateFinancialSummary();
-});
+// -----------------------
+// Geocodificación tolerante / búsqueda por locales y fallback
+// -----------------------
+async function tolerantSearchVariants(q, limit=6){
+  // Intenta varias variantes para encontrar locales o negocios si la búsqueda directa falla
+  const variants = [q, `${q} local`, `${q} tienda`, `${q} restaurante`, `${q} negocio`, `${q} lugar`];
+  for (const v of variants){
+    try{
+      const items = await nominatimSearch(v, limit);
+      if (items && items.length) return items;
+    }catch(_){ }
+  }
+  return [];
+}
 
+async function tolerantGeocode(q, options = {}){
+  // options: { municipio }
+  // 1) intento directo con geocodeNominatim
+  try{
+    return await geocodeNominatim(q);
+  }catch(_e){
+    // 2) buscar sugerencias tolerantes
+    const mun = options.municipio ? (', ' + options.municipio + ', Antioquia, Colombia') : '';
+    const tryQueries = [q, q + mun, `${q} ${mun}`.trim()];
+    for (const tq of tryQueries){
+      try{
+        const items = await tolerantSearchVariants(tq, 6);
+        if (items && items.length){
+          const it = items[0];
+          const lat = Number(it.lat), lon = Number(it.lon);
+          if (Number.isFinite(lat) && Number.isFinite(lon)){
+            return { lat, lon, display: it.display_name || tq, query: it.display_name || tq };
+          }
+        }
+      }catch(_){ }
+    }
+    // 3) como último recurso, devolver el primer resultado de una búsqueda amplia
+    try{
+      const items = await nominatimSearch(q, 10);
+      if (items && items.length){
+        const it = items[0];
+        const lat = Number(it.lat), lon = Number(it.lon);
+        if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat, lon, display: it.display_name || q, query: it.display_name || q };
+      }
+    }catch(_){ }
+    throw new Error(`No se encontró: ${q}`);
+  }
+}
+
+// -----------------------
+// Settings UI (modal) and mobile helpers
+// -----------------------
+function openSettings(){
+  const m = document.getElementById('settingsModal');
+  if (!m) return;
+  m.style.display = 'flex';
+  m.setAttribute('aria-hidden', 'false');
+}
+function closeSettings(){
+  const m = document.getElementById('settingsModal');
+  if (!m) return;
+  m.style.display = 'none';
+  m.setAttribute('aria-hidden', 'true');
+}
+
+function initSettingsUi(){
+  const btn = document.getElementById('btnSettings');
+  const close = document.getElementById('settingsClose');
+  const backdrop = document.getElementById('settingsModalBackdrop');
+  const save = document.getElementById('settingsSave');
+  const reset = document.getElementById('settingsReset');
+
+  if (btn) btn.addEventListener('click', () => {
+    const st = loadSettings();
+    // populate modal fields
+    try{ document.getElementById('settingAutoRouteModal').checked = !!st.autoRoute; }catch(_){ }
+    try{ document.getElementById('settingAutoNotifyModal').checked = !!st.autoNotify; }catch(_){ }
+    try{ document.getElementById('settingProximityModal').checked = (st.proximityEnabled !== false); }catch(_){ }
+    try{ document.getElementById('themeSelectModal').value = st.theme || 'default'; }catch(_){ }
+    openSettings();
+  });
+  if (close) close.addEventListener('click', closeSettings);
+  if (backdrop) backdrop.addEventListener('click', closeSettings);
+  if (save) save.addEventListener('click', () => {
+    const s = loadSettings();
+    s.autoRoute = !!document.getElementById('settingAutoRouteModal')?.checked;
+    s.autoNotify = !!document.getElementById('settingAutoNotifyModal')?.checked;
+    s.proximityEnabled = !!document.getElementById('settingProximityModal')?.checked;
+    s.theme = document.getElementById('themeSelectModal')?.value || 'default';
+    saveSettings(s);
+    try{
+      const ar = document.getElementById('settingAutoRoute');
+      const an = document.getElementById('settingAutoNotify');
+      if (ar) ar.checked = !!s.autoRoute;
+      if (an) an.checked = !!s.autoNotify;
+    }catch(_){ }
+    applyTheme(s.theme || 'default');
+    setStatus('Ajustes guardados.');
+    closeSettings();
+  });
+  if (reset) reset.addEventListener('click', () => {
+    localStorage.removeItem(LS_SETTINGS);
+    const s = loadSettings();
+    saveSettings(s);
+    applyTheme(s.theme || 'default');
+    setStatus('Ajustes restablecidos.');
+    closeSettings();
+  });
+  // keyboard escape
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSettings(); });
+}
+
+function openHelp(){
+  const m = document.getElementById('helpModal');
+  if (!m) return;
+  m.style.display = 'flex';
+  m.setAttribute('aria-hidden', 'false');
+}
+
+function closeHelp(){
+  const m = document.getElementById('helpModal');
+  if (!m) return;
+  m.style.display = 'none';
+  m.setAttribute('aria-hidden', 'true');
+}
+
+function initHelpUi(){
+  const btn = document.getElementById('btnHelp');
+  const close = document.getElementById('helpModalClose');
+  const backdrop = document.getElementById('helpModalBackdrop');
+  if (btn) btn.addEventListener('click', openHelp);
+  if (close) close.addEventListener('click', closeHelp);
+  if (backdrop) backdrop.addEventListener('click', closeHelp);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHelp(); });
+
+  try{
+    if (!localStorage.getItem(LS_HELP_SEEN)){
+      localStorage.setItem(LS_HELP_SEEN, '1');
+      setTimeout(openHelp, 400);
+    }
+  }catch(_){ }
+}

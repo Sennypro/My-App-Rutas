@@ -1,87 +1,180 @@
 // Módulo de mapa: marcadores por prioridad y comprobación de proximidad
-// Depende de `window.map`, `window.getSavedClients()` y funciones globales como `openClientModal`, `notifyUser`, `haversineMeters`.
+// Mejorado: validaciones, optimización, anti-spam, estructura limpia
 
 const markerLayerGroup = L.layerGroup();
 let clientMarkers = new Map();
+const notifiedClients = new Set();
+
+// =======================
+// UTILIDADES
+// =======================
+
+function getClientsSafe(){
+  return (window.getSavedClients?.() ?? window.savedClients ?? []);
+}
 
 function priorityColor(pr){
-  if (pr === 'high') return '#ef4444';
-  if (pr === 'medium') return '#f59e0b';
-  return '#22c55e';
+  if (pr === 'high') return '#ef4444';     // rojo
+  if (pr === 'medium') return '#f59e0b';   // naranja
+  return '#22c55e';                        // verde
 }
 
 function ensureLayer(){
   try{
-    if (window.map && !markerLayerGroup._map) markerLayerGroup.addTo(window.map);
-  }catch(e){}
+    if (window.map && !markerLayerGroup._map){
+      markerLayerGroup.addTo(window.map);
+    }
+  }catch(e){
+    console.error("Error asegurando layer:", e);
+  }
+}
+
+// =======================
+// MARCADORES
+// =======================
+
+function createMarker(c){
+  const m = L.circleMarker([c.lat, c.lon], {
+    radius: c.priority === 'high' ? 12 : 9,
+    color: priorityColor(c.priority),
+    weight: 2,
+    fillColor: '#0b1020',
+    fillOpacity: 0.9
+  }).addTo(markerLayerGroup);
+
+  m.bindTooltip(`${c.name} · ${c.placeDetail || ''}`, {
+    direction: 'top'
+  });
+
+  m.on('click', () => {
+    try{
+      window.openClientModal?.(c.id);
+      window.map?.panTo([c.lat, c.lon]);
+    }catch(e){
+      console.error("Error al hacer click en marcador:", e);
+    }
+  });
+
+  return m;
 }
 
 function clearClientMarkers(){
-  clientMarkers.forEach(m => markerLayerGroup.removeLayer(m));
+  clientMarkers.forEach(m => {
+    if (markerLayerGroup.hasLayer(m)){
+      markerLayerGroup.removeLayer(m);
+    }
+  });
   clientMarkers.clear();
 }
 
 function renderClientMarkers(){
   ensureLayer();
-  clearClientMarkers();
-  const clients = (window.getSavedClients ? window.getSavedClients() : window.savedClients) || [];
+
+  const clients = getClientsSafe();
+
   for (const c of clients){
-    if (!c.lat || !c.lon) continue;
-    const color = priorityColor(c.priority);
-    const m = L.circleMarker([c.lat, c.lon], {
-      radius: 9,
-      color: color,
-      weight: 2,
-      fillColor: '#0b1020',
-      fillOpacity: 0.9
-    }).addTo(markerLayerGroup);
-    m.bindTooltip(`${c.name} · ${c.placeDetail}`, { permanent: false, direction: 'top' });
-    m.on('click', () => {
-      if (typeof openClientModal === 'function') openClientModal(c.id);
-      if (window.map) window.map.panTo([c.lat, c.lon]);
-    });
+    if (c.lat == null || c.lon == null) continue;
+    if (clientMarkers.has(c.id)) continue;
+
+    const m = createMarker(c);
     clientMarkers.set(c.id, m);
   }
 }
 
 function updateMarkerForClient(client){
   ensureLayer();
+
+  if (client.lat == null || client.lon == null) return;
+
   const existing = clientMarkers.get(client.id);
+
   if (existing){
     existing.setLatLng([client.lat, client.lon]);
-    existing.setStyle({ color: priorityColor(client.priority) });
+    existing.setStyle({
+      color: priorityColor(client.priority),
+      radius: client.priority === 'high' ? 12 : 9
+    });
   } else {
-    renderClientMarkers();
+    const m = createMarker(client);
+    clientMarkers.set(client.id, m);
   }
 }
 
-// Comprobación periódica de proximidad (usa userLocation global mantenida por app.js)
+// =======================
+// PROXIMIDAD (GPS)
+// =======================
+
 let proximityInterval = null;
+
 function startProximityChecks(){
   if (proximityInterval) return;
+
   proximityInterval = setInterval(() => {
     try{
-      const clients = (window.getSavedClients ? window.getSavedClients() : window.savedClients) || [];
+      const clients = getClientsSafe();
       const user = window.userLocation;
+
       if (!user) return;
+
       for (const c of clients){
-        if (!c.lat || !c.lon) continue;
+        if (c.lat == null || c.lon == null) continue;
         if (c.orderState === 'Entregado' || c.orderState === 'Fallido') continue;
-        const d = haversineMeters([user.lat, user.lon], [c.lat, c.lon]);
-        if (d < 200){
-          if (typeof notifyUser === 'function') notifyUser(`Cerca de ${c.name}`, `Estás a ${Math.round(d)} m de ${c.name}.`);
+
+        const d = window.haversineMeters?.(
+          [user.lat, user.lon],
+          [c.lat, c.lon]
+        );
+
+        if (!d) continue;
+
+        // Filtro general (optimización)
+        if (d < 500){
+
+          // Notificación cercana real
+          if (d < 200 && !notifiedClients.has(c.id)){
+            window.notifyUser?.(
+              `Cerca de ${c.name}`,
+              `Estás a ${Math.round(d)} m de ${c.name}.`
+            );
+            notifiedClients.add(c.id);
+          }
         }
       }
-    }catch(_){ }
-  }, 12 * 1000);
-}
-function stopProximityChecks(){ if (proximityInterval){ clearInterval(proximityInterval); proximityInterval = null; } }
 
-// Exponer funciones
+    }catch(e){
+      console.error("Error en proximidad:", e);
+    }
+  }, 12000); // cada 12s
+}
+
+function stopProximityChecks(){
+  if (proximityInterval){
+    clearInterval(proximityInterval);
+    proximityInterval = null;
+  }
+}
+
+// =======================
+// EXPORTAR FUNCIONES
+// =======================
+
 window.renderClientMarkers = renderClientMarkers;
 window.updateMarkerForClient = updateMarkerForClient;
 window.startProximityChecksMap = startProximityChecks;
 window.stopProximityChecksMap = stopProximityChecks;
 
-// Auto-iniciar si el mapa ya existe
-setTimeout(() => { try{ if (window.map) { ensureLayer(); renderClientMarkers(); startProximityChecks(); } }catch(e){} }, 600);
+// =======================
+// INIT LIMPIO
+// =======================
+
+document.addEventListener("DOMContentLoaded", () => {
+  try{
+    if (window.map){
+      ensureLayer();
+      renderClientMarkers();
+      startProximityChecks();
+    }
+  }catch(e){
+    console.error("Error al iniciar mapa:", e);
+  }
+});

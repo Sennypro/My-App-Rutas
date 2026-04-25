@@ -26,7 +26,11 @@
       <div style="display:flex;gap:8px;align-items:center;">
         <button type="button" class="secondary" id="btnAddClient">➕ Agregar cliente</button>
         <button type="button" class="secondary" id="btnViewRoute">🗺️ Ver ruta</button>
-        <button type="button" class="secondary" id="btnSummary">📊 Resumen</button>
+        <!-- Resumen eliminado: se gestionará desde Ajustes -->
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;">
+          <button type="button" id="btnHelp" class="secondary btn-tiny" aria-label="Ayuda">❓</button>
+          <button type="button" id="btnSettings" class="secondary btn-tiny" aria-label="Ajustes">⚙️</button>
       </div>
       <div class="nav-chips">
         <span class="chip muted" id="chipDist">—</span>
@@ -141,7 +145,45 @@
         <div class="kv" style="margin-top:10px;">
           <b>Velocidad ref.</b><span id="speedLabel">35 km/h</span>
         </div>
-        <input id="speed" type="range" min="5" max="90" value="35" step="1" oninput="actualizarVelocidadUI()" title="Referencia para tiempos alternativos si OSRM falla">
+        </div>
+
+        <!-- Modal ajustes / configuración -->
+        <div id="settingsModal" class="modal" role="dialog" aria-hidden="true" style="display:none;">
+          <div class="modal-backdrop" id="settingsModalBackdrop"></div>
+          <div class="modal-panel" role="document" style="max-width:520px;">
+            <header style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">
+              <h3 style="margin:0;font-size:16px">Ajustes</h3>
+              <button type="button" class="secondary btn-tiny" id="settingsClose">Cerrar</button>
+            </header>
+            <div id="settingsBody">
+              <div class="card">
+                <h4 style="margin:0 0 8px;font-size:14px;">Preferencias</h4>
+                <label style="display:flex;align-items:center;gap:10px;min-height:44px;font-size:14px;">
+                  <input type="checkbox" id="settingAutoRouteModal"> Auto-calcular ruta al abrir
+                </label>
+                <label style="display:flex;align-items:center;gap:10px;min-height:44px;font-size:14px;">
+                  <input type="checkbox" id="settingAutoNotifyModal"> Recordatorio diario (notificaciones)
+                </label>
+                <label style="display:flex;align-items:center;gap:10px;min-height:44px;font-size:14px;">
+                  <input type="checkbox" id="settingProximityModal"> Notificar proximidad (200 m)
+                </label>
+                <div style="margin-top:8px;">
+                  <label class="hint">Tema</label>
+                  <select id="themeSelectModal" class="input-lg" style="margin-top:6px;">
+                    <option value="default">Predeterminado</option>
+                    <option value="purple">Morado</option>
+                    <option value="light">Blanco</option>
+                    <option value="dark">Negro</option>
+                  </select>
+                </div>
+                <div style="margin-top:10px;display:flex;gap:8px;">
+                  <button type="button" id="settingsSave" class="secondary">Guardar</button>
+                  <button type="button" id="settingsReset" class="danger">Restablecer valores</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
         <div class="kv" style="margin-top:10px;"><b>Tiempo restante</b><span id="etaTotal">—</span></div>
       </div>
 
@@ -178,7 +220,7 @@
         <div class="kv"><b>Total cobrado</b><span id="totalPaid">—</span></div>
         <div class="kv"><b>Total pendiente</b><span id="totalPending">—</span></div>
       </div>
-
+      
       </div><!-- /viewMain -->
 
       <div id="viewClients" class="view-panel">
@@ -253,7 +295,7 @@
         <p class="hint">Lunes a sábado: armá la lista de clientes por día. Podés cargar el día de hoy a la ruta o guardar lo que ya tenés en pantalla.</p>
         <div class="day-grid" id="weekDayButtons" role="tablist" aria-label="Día"></div>
         <p class="hint" id="weekDayLabel" style="margin-top:10px;font-weight:700;color:var(--text);"></p>
-        <div id="weekStopsList" class="stop-list" style="margin-top:8px;"></div>
+        <ul id="weekStopsList" class="stop-list" style="margin-top:8px;"></ul>
         <p id="weekEmpty" class="hint">Este día no tiene paradas guardadas.</p>
         <div class="btns" style="margin-top:10px;grid-template-columns:1fr 1fr;">
           <button type="button" class="secondary" id="btnWeekLoadToRoute">Cargar día a la ruta</button>
@@ -288,6 +330,27 @@
     <div style="display:flex;gap:8px;margin-top:12px;">
       <button type="button" id="clientModalDelivered">Marcar como entregado</button>
       <button type="button" class="secondary" id="clientModalEdit">Editar cliente</button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal ayuda / manual rápido -->
+<div id="helpModal" class="modal" role="dialog" aria-hidden="true" aria-labelledby="helpModalTitle" style="display:none;">
+  <div class="modal-backdrop" id="helpModalBackdrop"></div>
+  <div class="modal-panel" role="document" style="max-width:620px;">
+    <header style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">
+      <h3 id="helpModalTitle" style="margin:0;font-size:16px">Guía rápida</h3>
+      <button type="button" class="secondary btn-tiny" id="helpModalClose">Cerrar</button>
+    </header>
+    <div class="hint" style="margin-bottom:10px;">Pasos básicos para usar la app sin complicarte:</div>
+    <div class="card" style="margin-top:0;">
+      <ol class="stops" style="margin:0;">
+        <li>Entrá a <b>Clientes</b>, creá clientes y usá <b>Ubicar en mapa</b>.</li>
+        <li>Tocá <b>A la ruta</b> en los clientes que vas a visitar hoy.</li>
+        <li>Volvé a <b>Ruta</b> y presioná <b>Calcular ruta</b>.</li>
+        <li>Presioná <b>Navegar (GPS)</b> para seguimiento en tiempo real.</li>
+        <li>Usá <b>Ajustes (⚙️)</b> para tema, auto-ruta y notificaciones.</li>
+      </ol>
     </div>
   </div>
 </div>
